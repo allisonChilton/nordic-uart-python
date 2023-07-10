@@ -7,7 +7,7 @@ Additionally, there are a couple of other utilities for using as a CLI or to hel
 This is a very simple wrapper class that verifies the existence of the UUID corresponding to the service in the GATT. It then adds the RX and TX characteristics, allowing the user to read and write from them using `read` and `write` methods on the class. Here's an example:
 
 ```python
-
+WIP
 ```
 
 # Status

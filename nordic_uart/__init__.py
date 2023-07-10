@@ -1,0 +1,1 @@
+from nordic_uart.uart import NordicUARTClient

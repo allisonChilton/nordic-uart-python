@@ -13,34 +13,55 @@ logger = logging.getLogger(__name__)
 class NordicUARTException(Exception): ...
 
 class NordicUARTClient:
-    def __init__(self, device: BLEDevice | None = None) -> None:
-        self._device: BLEDevice | None = device
+    def __init__(self, device: BLEDevice | str) -> None:
+        self._device: BLEDevice | str = device
         self._connected: bool = False
         self._uart_service: BleakGATTService | None = None
         # RX / TX is from PERIPHERAL perspective (ie its inverted from client)
         self._rx_characteristic: BleakGATTCharacteristic | None = None
         self._tx_characteristic: BleakGATTCharacteristic | None = None
+        self._tasks = set()
+    
+    async def __aenter__(self) -> 'NordicUARTClient':
+        await self.connect()
+        return self
 
-    async def scan(self, device: BLEDevice, advertisement_data: AdvertisementData):
-        # TODO: move this to a module level function because we want to support any nordic uart not just the illumi
-        if not self._device and device.name and device.name.upper() in const.supported_models:
-            logger.info(f"Found supported device: {device.name} @ {device.address}")
-            self._device = device
+    async def __aexit__(self, *args):
+        try:
+            await asyncio.wait_for(asyncio.gather(*self._tasks), timeout=5)
+        finally:
+            await self.disconnect()
 
-    async def connect(self) -> None:
+    async def connect(self, retries: int = 3, timeout: float = 5.0) -> None:
         if not self._device:
             raise NordicUARTException("No device found")
         self.client = bleak.BleakClient(self._device)
-        await self.client.connect()
+        fail_count = 0
+        while fail_count < retries:
+            try:
+                await asyncio.wait_for(self.client.connect(), timeout)
+                break
+            except (bleak.BleakError, asyncio.TimeoutError):
+                # Sometimes device is not immediately ready if device is still coming out of sleep
+                await asyncio.sleep(0.5)
+                fail_count += 1
+                logging.debug(f"Failed to connect to {self._device} retrying ({fail_count}/3)")
+                continue
+        else:
+            raise NordicUARTException(f"Could not connect to {self._device}")
+
+        logging.info(f"Connected to {self._device}")
         self._connected = True
         await self._verify_service()
-
     
     async def disconnect(self) -> None:
+        for task in self._tasks:
+            task.cancel()
         if self._connected:
             await self.client.disconnect()
     
     async def _verify_service(self) -> None:
+        logger.debug("Loading services")
         services = self.client.services
         for service in services.services.values():
             logger.debug(f"Service found: {service}")
@@ -57,7 +78,7 @@ class NordicUARTClient:
         if not self._rx_characteristic or not self._tx_characteristic:
             raise NordicUARTException(f"Device does not have RX/TX characteristics {(const.UART_RX_CHARACTERISTIC, const.UART_TX_CHARACTERISTIC)}")
 
-        logger.info(f"UART service ({self._uart_service}) connected for {self._device.name} @ {self._device.address}")
+        logger.info(f"UART service ({self._uart_service}) connected for {self._device}")
 
     async def read(self) -> bytearray:
         if not self._connected:
@@ -68,24 +89,19 @@ class NordicUARTClient:
         if not self._connected:
             raise NordicUARTException("Not connected to device")
         await self.client.write_gatt_char(self._rx_characteristic, data, False)
+    
+    def task_write(self, data: bytes) -> asyncio.Task:
+        """Schedule a write to be performed 'soon'. If order matters, you should wait for the task to complete before sending next data stream."""
+        if not self._connected:
+            raise NordicUARTException("Not connected to device")
+        task = asyncio.get_event_loop().create_task(self.write(data))
+        # task = asyncio.create_task(self.write(data))
+        self._tasks.add(task)
+        return task
 
+    def flush(self) -> None:
+        """Wait for all scheduled writes to complete. Useful in REPLs"""
+        if not self._connected:
+            raise NordicUARTException("Not connected to device")
+        asyncio.get_event_loop().run_until_complete(asyncio.gather(*self._tasks))
 
-async def main():
-    uart = NordicUARTClient()
-    scanner = bleak.BleakScanner(uart.scan)
-    await scanner.start()
-    while not uart._device:
-        await asyncio.sleep(0.1)
-    await scanner.stop()
-    await uart.connect()
-    await uart.verify_service()
-    await uart.disconnect()
-        
-    return uart
-
-if __name__ == "__main__":
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
-    uart = asyncio.run(main())
